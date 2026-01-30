@@ -1,65 +1,278 @@
-import Image from "next/image";
+'use client'
+
+import { useState, useEffect } from 'react';
+import SetupStepIndicator from './components/SetupStepIndicator';
+import Header from './components/Header';
+import Footer from './components/Footer';
+import OrgStep from './components/OrgStep';
+import CredentialsStep from './components/CredentialsStep';
+import SignInStep from './components/SignInStep';
+import ChatInterface from './components/ChatInterface';
+import { generateCodeVerifier, generateCodeChallenge, storePKCEVerifier, getPKCEVerifier, clearPKCEVerifier } from './utils/pkce';
+
+type Step = 'org' | 'credentials' | 'signin';
+
+interface AsgardeoConfig {
+  orgName: string;
+  clientId: string;
+}
+
+interface UserInfo {
+  sub?: string;
+  email?: string;
+  username?: string;
+  given_name?: string;
+  family_name?: string;
+}
 
 export default function Home() {
+  const [currentStep, setCurrentStep] = useState<Step>('org');
+  const [config, setConfig] = useState<AsgardeoConfig>({
+    orgName: 'aigateway',
+    clientId: 'mVQrgCtgnWmTSFTrek0T9Y3lcoEa',
+  });
+  const [isConfigured, setIsConfigured] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [mounted, setMounted] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
+
+  // Ensure we're mounted before accessing localStorage
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  // Check if already configured on mount
+  useEffect(() => {
+    if (!mounted) return;
+    const savedConfig = sessionStorage.getItem('asgardeo-config');
+    const savedUserInfo = sessionStorage.getItem('user-info');
+    
+    if (savedConfig) {
+      const parsed = JSON.parse(savedConfig);
+      setConfig(parsed);
+      setIsConfigured(true);
+      setCurrentStep('signin');
+    }
+
+    if (savedUserInfo) {
+      const parsed = JSON.parse(savedUserInfo);
+      setUserInfo(parsed);
+      setIsAuthenticated(true);
+    }
+  }, [mounted]);
+
+  // Handle OAuth callback
+  useEffect(() => {
+    if (!mounted) return;
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const code = urlParams.get('code');
+    const error = urlParams.get('error');
+
+    if (error) {
+      setError(`Authentication failed: ${error}`);
+      // Clean up URL
+      window.history.replaceState({}, '', '/');
+      return;
+    }
+
+    if (code && !isAuthenticated) {
+      const handleCallback = async () => {
+        try {
+          const savedConfig = sessionStorage.getItem('asgardeo-config');
+          if (!savedConfig) {
+            setError('Configuration not found. Please start over.');
+            return;
+          }
+
+          const config = JSON.parse(savedConfig);
+          const codeVerifier = getPKCEVerifier();
+
+          if (!codeVerifier) {
+            setError('PKCE verification failed. Please try signing in again.');
+            return;
+          }
+
+          // Exchange code for tokens
+          const response = await fetch('/api/auth/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              code,
+              orgName: config.orgName,
+              clientId: config.clientId,
+              codeVerifier: codeVerifier,
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error('Failed to exchange authorization code');
+          }
+
+          const data = await response.json();
+
+          // Store tokens and user info
+          sessionStorage.setItem('access-token', data.tokens.access_token);
+          sessionStorage.setItem('user-info', JSON.stringify(data.userInfo));
+
+          setUserInfo(data.userInfo);
+          setIsAuthenticated(true);
+
+          // Clean up URL
+          window.history.replaceState({}, '', '/');
+        } catch (err) {
+          setError('Failed to complete authentication. Please try again.');
+          console.error(err);
+          // Clean up URL
+          window.history.replaceState({}, '', '/');
+        }
+      };
+
+      handleCallback();
+    }
+  }, [mounted, isAuthenticated]);
+
+  const handleOrgSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (config.orgName.trim()) {
+      setCurrentStep('credentials');
+    }
+  };
+
+  const handleCredentialsSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (config.clientId.trim()) {
+      setIsSaving(true);
+      setError(null);
+      
+      try {
+        // Save to session storage instead of .env
+        if (typeof window !== 'undefined') {
+          sessionStorage.setItem('asgardeo-config', JSON.stringify(config));
+        }
+        
+        setIsConfigured(true);
+        setCurrentStep('signin');
+      } catch (err) {
+        setError('Failed to save configuration. Please try again.');
+        console.error(err);
+      } finally {
+        setIsSaving(false);
+      }
+    }
+  };
+
+  const handleReset = () => {
+    sessionStorage.removeItem('asgardeo-config');
+    sessionStorage.removeItem('user-info');
+    sessionStorage.removeItem('access-token');
+    sessionStorage.removeItem('pkce_code_verifier');
+    setConfig({ orgName: '', clientId: '' });
+    setIsConfigured(false);
+    setIsAuthenticated(false);
+    setUserInfo(null);
+    setCurrentStep('org');
+  };
+
+  const handleSignIn = async () => {
+    try {
+      setIsSaving(true);
+      setError(null);
+
+      // Generate PKCE parameters
+      const codeVerifier = generateCodeVerifier();
+      const codeChallenge = await generateCodeChallenge(codeVerifier);
+      
+      // Store code verifier for later use in token exchange
+      storePKCEVerifier(codeVerifier);
+
+      // Get auth URL from backend
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          orgName: config.orgName,
+          clientId: config.clientId,
+          codeChallenge: codeChallenge,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to initiate authentication');
+      }
+
+      const data = await response.json();
+      
+      // Redirect to Asgardeo login
+      window.location.href = data.authUrl;
+    } catch (err) {
+      setError('Failed to sign in. Please try again.');
+      console.error(err);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleSignOut = () => {
+    sessionStorage.removeItem('user-info');
+    sessionStorage.removeItem('access-token');
+    clearPKCEVerifier();
+    setIsAuthenticated(false);
+    setUserInfo(null);
+  };
+
+  // If authenticated, show chat interface directly
+  if (isAuthenticated && userInfo) {
+    return (
+      <ChatInterface
+        orgName={config.orgName}
+        userInfo={userInfo}
+        onSignOut={handleSignOut}
+        onReset={handleReset}
+      />
+    );
+  }
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+    <div className="min-h-screen flex flex-col items-center justify-center p-8">
+      <div className="w-full max-w-xl">
+        <Header />
+
+        <SetupStepIndicator currentStep={currentStep} />
+
+        {currentStep === 'org' && (
+          <OrgStep config={config} setConfig={setConfig} onSubmit={handleOrgSubmit} />
+        )}
+
+        {currentStep === 'credentials' && (
+          <CredentialsStep
+            config={config}
+            setConfig={setConfig}
+            isSaving={isSaving}
+            error={error}
+            onBack={() => setCurrentStep('org')}
+            onSubmit={handleCredentialsSubmit}
+          />
+        )}
+
+        {currentStep === 'signin' && (
+          <SignInStep
+            config={config}
+            isConfigured={isConfigured}
+            isSaving={isSaving}
+            error={error}
+            isAuthenticated={isAuthenticated}
+            handleSignIn={handleSignIn}
+            handleReset={handleReset}
+            userInfo={userInfo}
+            handleSignOut={handleSignOut}
+          />
+        )}
+
+        <Footer />
+      </div>
     </div>
   );
 }
